@@ -24,26 +24,11 @@ import torch
 
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import make_robot_action, prepare_observation_for_inference
-from lerobot.processor import PolicyProcessorPipeline
+from lerobot.processor import PolicyProcessorPipeline, RelativeActionsProcessorStep
 
 from .base import InferenceEngine
 
 logger = logging.getLogger(__name__)
-
-
-# TODO(Steven): support relative-action policies.  The per-tick flow refreshes
-# ``RelativeActionsProcessorStep._last_state`` every call, so cached chunk
-# actions popped on later ticks get reanchored to the *current* robot state and
-# absolute targets drift through the chunk.  Relative-action policies are
-# rejected at context-build time today; RTC postprocesses the whole chunk and
-# is unaffected.
-#
-# Candidate fix: drive the policy via ``predict_action_chunk`` and serve a
-# local FIFO of postprocessed actions.  Eliminates drift by construction and
-# saves per-tick pre/post work, but bypasses ``select_action`` — needs
-# fallbacks for SAC (raises), ACT temporal ensembling (ensembler lives in
-# ``select_action``), and Diffusion-family (obs-history queues populated as a
-# side effect of ``select_action``).
 
 
 class SyncInferenceEngine(InferenceEngine):
@@ -73,6 +58,14 @@ class SyncInferenceEngine(InferenceEngine):
         self._task = task
         self._device = torch.device(device or "cpu")
         self._robot_type = robot_type
+        self._relative_actions = any(
+            isinstance(step, RelativeActionsProcessorStep) and step.enabled
+            for step in getattr(preprocessor, "steps", ())
+        )
+        if self._relative_actions:
+            logger.info(
+                "SyncInferenceEngine initialized with relative actions; generating a fresh chunk per tick"
+            )
         logger.info(
             "SyncInferenceEngine initialized (device=%s, action_keys=%d)",
             self._device,
@@ -112,9 +105,18 @@ class SyncInferenceEngine(InferenceEngine):
                 observation, self._device, self._task, self._robot_type
             )
             observation = self._preprocessor(observation)
-            action = self._policy.select_action(observation)
+            if self._relative_actions:
+                # Relative actions are anchored to the observation used for
+                # that inference. A policy's select_action() may retain a
+                # multi-step queue, whose tail would be anchored to a later
+                # state and drift. Replan and execute the first action each tick.
+                action = self._policy.predict_action_chunk(observation)[:, :1]
+            else:
+                action = self._policy.select_action(observation)
             action = self._postprocessor(action)
         action_tensor = action.squeeze(0).cpu()
+        if self._relative_actions and action_tensor.ndim == 2:
+            action_tensor = action_tensor[0]
 
         # Reorder to match dataset action ordering so the caller can treat
         # the returned tensor uniformly across backends.
